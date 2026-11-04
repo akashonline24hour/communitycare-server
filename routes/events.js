@@ -272,4 +272,42 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
+// 10. PUT /events/:id - Update event details
+router.put("/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    const { title, description, location, eventDate, eventType } = req.body;
+    const { eventsCollection } = getCollections(req);
+
+    const updateDoc = {
+      $set: {
+        title,
+        description,
+        location,
+        eventDate: new Date(eventDate),
+        eventType,
+        updatedAt: new Date(),
+      },
+    };
+
+    const result = await eventsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc,
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    res.status(200).json({ message: "Event updated successfully" });
+  } catch (error) {
+    console.error("Error updating event:", error);
+    res.status(500).json({ message: "Failed to update event" });
+  }
+});
+
 export default router;
