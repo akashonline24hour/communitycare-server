@@ -108,10 +108,11 @@ router.post("/join", async (req, res) => {
         .json({ message: "You have already joined this event" });
     }
 
-    // Fetch details to attach snapshot for quick retrieval
+    // Fetch event details to ensure existence
     const event = await eventsCollection.findOne({
       _id: new ObjectId(eventId),
     });
+
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
     }
@@ -124,7 +125,14 @@ router.post("/join", async (req, res) => {
       joinedAt: new Date(),
     };
 
+    // Insert registration record
     await registrationsCollection.insertOne(registration);
+
+    // Add user email to attendees array on main event document
+    await eventsCollection.updateOne(
+      { _id: new ObjectId(eventId) },
+      { $addToSet: { attendees: userEmail } },
+    );
 
     res.status(201).json({ message: "Successfully registered for event" });
   } catch (error) {
@@ -144,7 +152,8 @@ router.post("/leave", async (req, res) => {
         .json({ message: "Missing event ID or user email" });
     }
 
-    const { registrationsCollection } = getCollections(req);
+    const { registrationsCollection, eventsCollection } = getCollections(req);
+
     const result = await registrationsCollection.deleteOne({
       eventId,
       userEmail,
@@ -154,6 +163,12 @@ router.post("/leave", async (req, res) => {
       return res.status(404).json({ message: "Registration record not found" });
     }
 
+    // Remove user email from attendees array on main event document
+    await eventsCollection.updateOne(
+      { _id: new ObjectId(eventId) },
+      { $pull: { attendees: userEmail } },
+    );
+
     res.status(200).json({ message: "Successfully left the event" });
   } catch (error) {
     console.error("Error leaving event:", error);
@@ -161,7 +176,7 @@ router.post("/leave", async (req, res) => {
   }
 });
 
-// 7. POST /events - Create a new community event (includes eventType)
+// 7. POST /events - Create a new community event
 router.post("/", async (req, res) => {
   try {
     const {
@@ -169,10 +184,11 @@ router.post("/", async (req, res) => {
       description,
       location,
       eventDate,
-      eventType, // Added eventType extraction
+      eventType,
       thumbnail,
       organizerEmail,
       organizerName,
+      organizerImage, // Extracted from request
     } = req.body;
 
     if (!title || !location || !eventDate || !eventType || !organizerEmail) {
@@ -186,10 +202,12 @@ router.post("/", async (req, res) => {
       description,
       location,
       eventDate: new Date(eventDate),
-      eventType, // Saved to MongoDB document
+      eventType,
       thumbnail,
       organizerEmail,
       organizerName,
+      organizerImage: organizerImage || "", // Persisted to MongoDB document
+      attendees: [], // Initialized empty array for participants
       createdAt: new Date(),
     };
 
@@ -238,7 +256,6 @@ router.delete("/:id", async (req, res) => {
 
     const { eventsCollection, registrationsCollection } = getCollections(req);
 
-    // Remove event and any associated user registrations
     const deleteResult = await eventsCollection.deleteOne({
       _id: new ObjectId(id),
     });
