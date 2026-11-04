@@ -73,7 +73,7 @@ router.get("/joined/:email", async (req, res) => {
 
     const joinedEvents = await registrationsCollection
       .find({ userEmail: email })
-      .sort({ joinedAt: -1 })
+      .sort({ "eventDetails.eventDate": 1 })
       .toArray();
 
     res.status(200).json(joinedEvents);
