@@ -7,7 +7,15 @@ import eventRoutes from "./routes/events.js";
 const app = express();
 const port = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://communitycare-client.vercel.app",
+      "http://localhost:3000",
+    ],
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGODB_URI);
