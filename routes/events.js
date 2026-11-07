@@ -1,9 +1,20 @@
 import express from "express";
 import { ObjectId } from "mongodb";
+import verifyToken, { sameUser } from "../middleware/verifyToken.js";
 
 const router = express.Router();
 
-// Helper function to inject database connection from app
+// Must match the options in your Create/Update Event dropdown
+const EVENT_TYPES = [
+  "Cleanup",
+  "Plantation",
+  "Donation",
+  "Winter Relief",
+  "Food Drive",
+  "Health Camp",
+  "Education",
+];
+
 const getCollections = (req) => {
   const db = req.app.locals.db;
   return {
@@ -12,15 +23,67 @@ const getCollections = (req) => {
   };
 };
 
-// 1. GET /events - Fetch all upcoming events (sorted by date ascending)
+const startOfToday = () => {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  return d;
+};
+
+const isHttpUrl = (value) => {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+// Shared validation for create and update
+function validateEvent(body) {
+  const errors = [];
+  const title = String(body.title ?? "").trim();
+  const description = String(body.description ?? "").trim();
+  const location = String(body.location ?? "").trim();
+  const eventType = String(body.eventType ?? "").trim();
+  const thumbnail = String(body.thumbnail ?? "").trim();
+  const eventDate = new Date(body.eventDate);
+
+  if (title.length < 3 || title.length > 100)
+    errors.push("Title must be between 3 and 100 characters");
+  if (description.length < 10 || description.length > 2000)
+    errors.push("Description must be between 10 and 2000 characters");
+  if (location.length < 3 || location.length > 150)
+    errors.push("Location must be between 3 and 150 characters");
+  if (!EVENT_TYPES.includes(eventType)) errors.push("Invalid event type");
+  if (!isHttpUrl(thumbnail)) errors.push("Thumbnail must be a valid URL");
+
+  if (Number.isNaN(eventDate.getTime())) {
+    errors.push("Event date is invalid");
+  } else {
+    const maxDate = new Date();
+    maxDate.setFullYear(maxDate.getFullYear() + 5);
+    if (eventDate < startOfToday())
+      errors.push("Event date must be in the future");
+    else if (eventDate > maxDate)
+      errors.push("Event date cannot be more than 5 years ahead");
+  }
+
+  return {
+    errors,
+    data: { title, description, location, eventType, thumbnail, eventDate },
+  };
+}
+
+// ---------- PUBLIC ROUTES ----------
+
+// GET /api/events - all upcoming events
 router.get("/", async (req, res) => {
   try {
     const { eventsCollection } = getCollections(req);
     const events = await eventsCollection
-      .find({})
+      .find({ eventDate: { $gte: startOfToday() } })
       .sort({ eventDate: 1 })
       .toArray();
-
     res.status(200).json(events);
   } catch (error) {
     console.error("Error fetching events:", error);
@@ -28,16 +91,15 @@ router.get("/", async (req, res) => {
   }
 });
 
-// 2. GET /events/recent-upcoming - Fetch top 6 upcoming events for Homepage
+// GET /api/events/recent-upcoming - 6 nearest upcoming events
 router.get("/recent-upcoming", async (req, res) => {
   try {
     const { eventsCollection } = getCollections(req);
     const events = await eventsCollection
-      .find({})
+      .find({ eventDate: { $gte: startOfToday() } })
       .sort({ eventDate: 1 })
       .limit(6)
       .toArray();
-
     res.status(200).json(events);
   } catch (error) {
     console.error("Error fetching recent events:", error);
@@ -45,18 +107,16 @@ router.get("/recent-upcoming", async (req, res) => {
   }
 });
 
-// 3. GET /events/organizer/:email - Fetch events created by specific user
-// (Placed BEFORE /:id to prevent route collision)
-router.get("/organizer/:email", async (req, res) => {
-  try {
-    const { email } = req.params;
-    const { eventsCollection } = getCollections(req);
+// ---------- PRIVATE READ ROUTES ----------
 
+// GET /api/events/organizer/:email - events created by the logged-in user
+router.get("/organizer/:email", verifyToken, sameUser, async (req, res) => {
+  try {
+    const { eventsCollection } = getCollections(req);
     const myEvents = await eventsCollection
-      .find({ organizerEmail: email })
+      .find({ organizerEmail: req.user.email })
       .sort({ createdAt: -1 })
       .toArray();
-
     res.status(200).json(myEvents);
   } catch (error) {
     console.error("Error fetching organizer events:", error);
@@ -64,71 +124,92 @@ router.get("/organizer/:email", async (req, res) => {
   }
 });
 
-// 4. GET /events/joined/:email - Fetch all events joined by user
-// (Placed BEFORE /:id to prevent route collision)
-router.get("/joined/:email", async (req, res) => {
+// GET /api/events/joined/:email - events joined by the logged-in user.
+// Event data is looked up live, so edits and attendee lists stay current.
+router.get("/joined/:email", verifyToken, sameUser, async (req, res) => {
   try {
-    const { email } = req.params;
     const { registrationsCollection } = getCollections(req);
-
-    const joinedEvents = await registrationsCollection
-      .find({ userEmail: email })
-      .sort({ "eventDetails.eventDate": 1 })
+    const joined = await registrationsCollection
+      .aggregate([
+        { $match: { userEmail: req.user.email } },
+        {
+          $addFields: {
+            eventObjectId: {
+              $convert: { input: "$eventId", to: "objectId", onError: null },
+            },
+          },
+        },
+        {
+          $lookup: {
+            from: "events",
+            localField: "eventObjectId",
+            foreignField: "_id",
+            as: "eventDetails",
+          },
+        },
+        { $unwind: "$eventDetails" },
+        { $project: { eventObjectId: 0 } },
+        { $sort: { "eventDetails.eventDate": 1 } },
+      ])
       .toArray();
-
-    res.status(200).json(joinedEvents);
+    res.status(200).json(joined);
   } catch (error) {
     console.error("Error fetching joined events:", error);
     res.status(500).json({ message: "Failed to fetch joined events" });
   }
 });
 
-// 5. POST /events/join - Join/Register for an event
-router.post("/join", async (req, res) => {
-  try {
-    const { eventId, userEmail, userName } = req.body;
+// ---------- PRIVATE WRITE ROUTES ----------
 
-    if (!eventId || !userEmail) {
-      return res
-        .status(400)
-        .json({ message: "Missing event ID or user email" });
+// POST /api/events/join - the user comes from the token, not the body
+router.post("/join", verifyToken, async (req, res) => {
+  try {
+    const { eventId } = req.body;
+    if (!eventId || !ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID" });
     }
 
     const { registrationsCollection, eventsCollection } = getCollections(req);
 
-    // Check if user already joined
-    const existingRegistration = await registrationsCollection.findOne({
+    const event = await eventsCollection.findOne({
+      _id: new ObjectId(eventId),
+    });
+    if (!event) return res.status(404).json({ message: "Event not found" });
+
+    if (new Date(event.eventDate) < startOfToday()) {
+      return res
+        .status(400)
+        .json({ message: "This event has already taken place" });
+    }
+
+    const userEmail = req.user.email;
+    const existing = await registrationsCollection.findOne({
       eventId,
       userEmail,
     });
-
-    if (existingRegistration) {
+    if (existing) {
       return res
         .status(400)
         .json({ message: "You have already joined this event" });
     }
 
-    // Fetch event details to ensure existence
-    const event = await eventsCollection.findOne({
-      _id: new ObjectId(eventId),
-    });
-
-    if (!event) {
-      return res.status(404).json({ message: "Event not found" });
+    try {
+      await registrationsCollection.insertOne({
+        eventId,
+        userEmail,
+        userName: req.user.name || req.body.userName || "",
+        joinedAt: new Date(),
+      });
+    } catch (err) {
+      // Unique index hit: two fast clicks
+      if (err.code === 11000) {
+        return res
+          .status(400)
+          .json({ message: "You have already joined this event" });
+      }
+      throw err;
     }
 
-    const registration = {
-      eventId,
-      userEmail,
-      userName,
-      eventDetails: event,
-      joinedAt: new Date(),
-    };
-
-    // Insert registration record
-    await registrationsCollection.insertOne(registration);
-
-    // Add user email to attendees array on main event document
     await eventsCollection.updateOne(
       { _id: new ObjectId(eventId) },
       { $addToSet: { attendees: userEmail } },
@@ -141,29 +222,25 @@ router.post("/join", async (req, res) => {
   }
 });
 
-// 6. POST /events/leave - Cancel user registration for an event
-router.post("/leave", async (req, res) => {
+// POST /api/events/leave
+router.post("/leave", verifyToken, async (req, res) => {
   try {
-    const { eventId, userEmail } = req.body;
-
-    if (!eventId || !userEmail) {
-      return res
-        .status(400)
-        .json({ message: "Missing event ID or user email" });
+    const { eventId } = req.body;
+    if (!eventId || !ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID" });
     }
 
     const { registrationsCollection, eventsCollection } = getCollections(req);
+    const userEmail = req.user.email;
 
     const result = await registrationsCollection.deleteOne({
       eventId,
       userEmail,
     });
-
     if (result.deletedCount === 0) {
       return res.status(404).json({ message: "Registration record not found" });
     }
 
-    // Remove user email from attendees array on main event document
     await eventsCollection.updateOne(
       { _id: new ObjectId(eventId) },
       { $pull: { attendees: userEmail } },
@@ -176,38 +253,20 @@ router.post("/leave", async (req, res) => {
   }
 });
 
-// 7. POST /events - Create a new community event
-router.post("/", async (req, res) => {
+// POST /api/events - create (organizer comes from the token)
+router.post("/", verifyToken, async (req, res) => {
   try {
-    const {
-      title,
-      description,
-      location,
-      eventDate,
-      eventType,
-      thumbnail,
-      organizerEmail,
-      organizerName,
-      organizerImage, // Extracted from request
-    } = req.body;
-
-    if (!title || !location || !eventDate || !eventType || !organizerEmail) {
-      return res
-        .status(400)
-        .json({ message: "Missing required event fields or event type" });
+    const { errors, data } = validateEvent(req.body);
+    if (errors.length) {
+      return res.status(400).json({ message: errors[0], errors });
     }
 
     const newEvent = {
-      title,
-      description,
-      location,
-      eventDate: new Date(eventDate),
-      eventType,
-      thumbnail,
-      organizerEmail,
-      organizerName,
-      organizerImage: organizerImage || "", // Persisted to MongoDB document
-      attendees: [], // Initialized empty array for participants
+      ...data,
+      organizerEmail: req.user.email,
+      organizerName: req.user.name || req.body.organizerName || "",
+      organizerImage: req.user.image || req.body.organizerImage || "",
+      attendees: [],
       createdAt: new Date(),
     };
 
@@ -224,8 +283,27 @@ router.post("/", async (req, res) => {
   }
 });
 
-// 8. GET /events/:id - Fetch single event by ID
+// ---------- /:id ROUTES ----------
+
+// GET /api/events/:id - public event details
 router.get("/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+    const { eventsCollection } = getCollections(req);
+    const event = await eventsCollection.findOne({ _id: new ObjectId(id) });
+    if (!event) return res.status(404).json({ message: "Event not found" });
+    res.status(200).json(event);
+  } catch (error) {
+    console.error("Error fetching event details:", error);
+    res.status(500).json({ message: "Failed to fetch event details" });
+  }
+});
+
+// PUT /api/events/:id - update (creator only)
+router.put("/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -234,20 +312,38 @@ router.get("/:id", async (req, res) => {
 
     const { eventsCollection } = getCollections(req);
     const event = await eventsCollection.findOne({ _id: new ObjectId(id) });
-
-    if (!event) {
-      return res.status(404).json({ message: "Event not found" });
+    if (!event) return res.status(404).json({ message: "Event not found" });
+    if (event.organizerEmail !== req.user.email) {
+      return res
+        .status(403)
+        .json({ message: "You can only update your own events" });
     }
 
-    res.status(200).json(event);
+    // If the form doesn't send a thumbnail, keep the existing one
+    const body = { ...req.body };
+    if (body.thumbnail === undefined || body.thumbnail === "") {
+      body.thumbnail = event.thumbnail;
+    }
+
+    const { errors, data } = validateEvent(body);
+    if (errors.length) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    await eventsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { ...data, updatedAt: new Date() } },
+    );
+
+    res.status(200).json({ message: "Event updated successfully" });
   } catch (error) {
-    console.error("Error fetching event details:", error);
-    res.status(500).json({ message: "Failed to fetch event details" });
+    console.error("Error updating event:", error);
+    res.status(500).json({ message: "Failed to update event" });
   }
 });
 
-// 9. DELETE /events/:id - Delete an event by ID
-router.delete("/:id", async (req, res) => {
+// DELETE /api/events/:id - delete (creator only)
+router.delete("/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -255,58 +351,21 @@ router.delete("/:id", async (req, res) => {
     }
 
     const { eventsCollection, registrationsCollection } = getCollections(req);
-
-    const deleteResult = await eventsCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
-    await registrationsCollection.deleteMany({ eventId: id });
-
-    if (deleteResult.deletedCount === 0) {
-      return res.status(404).json({ message: "Event not found" });
+    const event = await eventsCollection.findOne({ _id: new ObjectId(id) });
+    if (!event) return res.status(404).json({ message: "Event not found" });
+    if (event.organizerEmail !== req.user.email) {
+      return res
+        .status(403)
+        .json({ message: "You can only delete your own events" });
     }
+
+    await eventsCollection.deleteOne({ _id: new ObjectId(id) });
+    await registrationsCollection.deleteMany({ eventId: id });
 
     res.status(200).json({ message: "Event deleted successfully" });
   } catch (error) {
     console.error("Error deleting event:", error);
     res.status(500).json({ message: "Failed to delete event" });
-  }
-});
-
-// 10. PUT /events/:id - Update event details
-router.put("/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid event ID format" });
-    }
-
-    const { title, description, location, eventDate, eventType } = req.body;
-    const { eventsCollection } = getCollections(req);
-
-    const updateDoc = {
-      $set: {
-        title,
-        description,
-        location,
-        eventDate: new Date(eventDate),
-        eventType,
-        updatedAt: new Date(),
-      },
-    };
-
-    const result = await eventsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc,
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ message: "Event not found" });
-    }
-
-    res.status(200).json({ message: "Event updated successfully" });
-  } catch (error) {
-    console.error("Error updating event:", error);
-    res.status(500).json({ message: "Failed to update event" });
   }
 });
 
