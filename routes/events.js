@@ -283,6 +283,42 @@ router.post("/", verifyToken, async (req, res) => {
   }
 });
 
+// POST /api/events/sync-profile - keep organizer name/photo on my events up to date
+router.post("/sync-profile", verifyToken, async (req, res) => {
+  try {
+    const name = String(req.body.name ?? "").trim();
+    const image = String(req.body.image ?? "").trim();
+
+    if (name.length < 2 || name.length > 50) {
+      return res
+        .status(400)
+        .json({ message: "Name must be between 2 and 50 characters" });
+    }
+    if (image && !isHttpUrl(image)) {
+      return res.status(400).json({ message: "Photo must be a valid URL" });
+    }
+
+    const { eventsCollection, registrationsCollection } = getCollections(req);
+
+    // The user is identified by the token, so only their own events change
+    const result = await eventsCollection.updateMany(
+      { organizerEmail: req.user.email },
+      { $set: { organizerName: name, organizerImage: image } },
+    );
+    await registrationsCollection.updateMany(
+      { userEmail: req.user.email },
+      { $set: { userName: name } },
+    );
+
+    res
+      .status(200)
+      .json({ message: "Profile synced", updated: result.modifiedCount });
+  } catch (error) {
+    console.error("Error syncing profile:", error);
+    res.status(500).json({ message: "Failed to sync profile" });
+  }
+});
+
 // ---------- /:id ROUTES ----------
 
 // GET /api/events/:id - public event details
